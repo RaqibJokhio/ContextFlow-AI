@@ -1,17 +1,19 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+from groq import Groq
+from pydantic import BaseModel
 import os
 import shutil
 import tempfile
-
 from parsers import parse_document
 from chunker import chunk_text
-from embedder import embed_chunks
+from embedder import embed_chunks, embed_query
 from uploader import upload_chunks
+from uploader import index
 
 load_dotenv()
-
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 app = FastAPI(title="ContextFlow AI")
 
 app.add_middleware(
@@ -124,3 +126,64 @@ async def upload_url(url: str):
 
     except Exception as e:
         raise HTTPException(status_code=422, detail=str(e))
+    
+class QueryRequest(BaseModel):
+    question: str
+    top_k: int = 3
+
+
+@app.post("/query")
+async def query_documents(request: QueryRequest):
+    """
+    Takes a user question, retrieves the most relevant chunks from
+    Pinecone, and asks Groq to answer using only that retrieved context.
+    Returns the answer plus the sources used, so the response is traceable.
+    """
+    query_vector = embed_query(request.question)
+
+    results = index.query(
+        vector=query_vector,
+        top_k=request.top_k,
+        include_metadata=True
+    )
+
+    if not results["matches"]:
+        return {
+            "answer": "No relevant documents found. Please upload some documents first.",
+            "sources": []
+        }
+
+    # Build context block from retrieved chunks
+    context_parts = []
+    sources = []
+    for match in results["matches"]:
+        context_parts.append(match["metadata"]["text"])
+        sources.append({
+            "source": match["metadata"]["source"],
+            "score": round(match["score"], 4)
+        })
+
+    context = "\n\n".join(context_parts)
+
+    prompt = f"""Answer the question using ONLY the context below. If the context doesn't contain enough information to answer, say so clearly instead of guessing.
+
+Context:
+{context}
+
+Question: {request.question}
+
+Answer:"""
+
+    completion = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3,
+        max_tokens=1000
+    )
+
+    answer = completion.choices[0].message.content
+
+    return {
+        "answer": answer,
+        "sources": sources
+    }
